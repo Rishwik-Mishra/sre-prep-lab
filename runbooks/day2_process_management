@@ -1,0 +1,248 @@
+Day 2 Session 1 — Process Management
+The mental model first
+
+A process is a running program. But from the kernel's perspective, it's a collection of resources: memory, open files, CPU time, and state. Everything the kernel knows about a process lives in /proc/<pid>/.
+
+This is the "everything is a file" model from Day 1 applied to processes.
+
+What a process actually is in memory
+
+When a program runs, the kernel carves out a virtual address space for it:
+
+High addresses
+  Kernel space     ← process can't touch this directly, uses syscalls
+  Stack            ← function calls, local variables (grows downward)
+  ↓
+  (gap)
+  ↑
+  Heap             ← dynamic allocation (malloc, Python objects)
+  Data segment     ← global/static variables
+  Text segment     ← the actual program code (read-only)
+Low addresses
+
+SRE relevance: when you see a process consuming growing memory over time, it's usually the heap growing — a memory leak. The stack rarely causes this.
+
+Process states
+
+Run this and look at the STAT column:
+
+bash
+ps aux
+
+The states you'll see:
+
+State	Meaning	SRE relevance
+R	Running or runnable	Normal
+S	Sleeping (interruptible)	Normal, waiting for something
+D	Uninterruptible sleep	Waiting for I/O — cannot be killed
+Z	Zombie	Process finished, parent hasn't read exit status
+T	Stopped	Paused (Ctrl+Z or SIGSTOP)
+
+D state is critical. If you see many D-state processes, the system is stuck waiting on I/O — usually a disk or NFS problem. SIGKILL does nothing. You wait for the I/O to complete or reboot.
+
+Zombie processes aren't dangerous by themselves — they consume no CPU or memory, just a PID slot. But if you have thousands, you'll exhaust PIDs and can't create new processes. Root cause is always the parent process not calling wait().
+
+Lab — process inspection
+bash
+# All processes
+ps aux
+
+# What each column means:
+# USER    — who owns the process
+# PID     — process ID
+# %CPU    — CPU usage
+# %MEM    — memory usage
+# VSZ     — virtual memory size (kb) — includes everything mapped, not all in RAM
+# RSS     — resident set size (kb) — actual RAM currently used. This is what matters.
+# STAT    — process state
+# START   — when it started
+# TIME    — total CPU time consumed
+# COMMAND — what command started it
+
+# Top 10 by CPU
+ps aux | sort -k3 -rn | head -10
+
+# Top 10 by memory
+ps aux | sort -k4 -rn | head -10
+
+# Process tree — see parent-child relationships
+ps -ef --forest
+
+# Your current shell's process info
+cat /proc/$$/status
+
+# Memory map of your shell
+cat /proc/$$/maps
+
+Look at the output of cat /proc/$$/status. You'll see fields like:
+
+Name:   bash
+State:  S (sleeping)
+Pid:    1234
+PPid:   1233        ← parent PID
+VmRSS:  4532 kB    ← actual RAM used
+VmSize: 15432 kB   ← virtual memory
+Threads: 1
+
+$$ is a bash variable that holds your current shell's PID. This trick works anywhere.
+
+Real-time monitoring
+bash
+# top — the classic
+top
+# Key columns: PR (priority), NI (nice value), VIRT, RES, SHR, S (state)
+# Press: M to sort by memory, P to sort by CPU, k to kill, q to quit
+# Press 1 to see per-CPU breakdown
+
+# htop — more readable
+htop
+# F5 for tree view, F6 to sort, F9 to kill
+
+# Watch top 5 CPU consumers, refresh every second
+watch -n 1 'ps aux | sort -k3 -rn | head -6'
+Signals
+
+Signals are how you communicate with a running process. The process either handles the signal, ignores it, or gets terminated by it.
+
+bash
+# Send SIGTERM (graceful stop — process can clean up)
+kill -15 <PID>
+# or
+kill <PID>      # SIGTERM is the default
+
+# Send SIGKILL (immediate, cannot be caught or ignored)
+kill -9 <PID>
+
+# Send SIGHUP (reload config — many daemons listen for this)
+kill -1 <PID>
+
+# List all signals
+kill -l
+
+The operational difference:
+
+SIGTERM → process receives it, can finish current requests, close connections, flush buffers, then exit. This is what systemctl stop sends first.
+
+SIGKILL → kernel terminates the process immediately. No cleanup. Open files may be left in inconsistent state. Use only when SIGTERM doesn't work.
+
+In practice: always try SIGTERM first. Wait 5-10 seconds. If still running, then SIGKILL.
+
+bash
+# Lab — see this yourself
+sleep 1000 &        # start a background process, note the PID printed
+jobs                # see background jobs
+kill -15 <PID>      # try SIGTERM
+ps aux | grep sleep # confirm it's gone
+
+sleep 1000 &
+kill -9 <PID>       # SIGKILL
+ps aux | grep sleep # gone immediately
+nice and renice — CPU priority
+
+Nice value ranges from -20 (highest priority, gets more CPU) to +19 (lowest priority, gets least CPU). Default is 0.
+
+Regular users can only lower priority (increase nice value). Root can do both.
+
+bash
+# Start a process with low priority
+nice -n 10 sleep 100 &
+
+# Check the NI column in ps
+ps aux | grep sleep
+
+# Change priority of a running process
+sudo renice -n -5 -p <PID>
+
+# In top: the NI column shows nice value, PR shows actual kernel priority (PR = 20 + NI)
+
+SRE relevance: if a batch job is competing with your web service for CPU, you renice the batch job to a higher nice value so the web service gets priority.
+
+Script task: process_monitor.sh
+
+Write this and commit it to GitHub under sre-prep-lab/scripts/:
+
+bash
+#!/bin/bash
+# process_monitor.sh
+# Shows system process health: top consumers, zombies, load average
+# Usage: ./process_monitor.sh
+
+echo "============================================"
+echo " PROCESS MONITOR — $(hostname) — $(date)"
+echo "============================================"
+
+echo ""
+echo "--- Load Average ---"
+cat /proc/loadavg
+# Format: 1min 5min 15min running/total lastpid
+# Rule: if 1min avg > nproc, system is overloaded
+NPROC=$(nproc)
+echo "CPU count: $NPROC"
+
+echo ""
+echo "--- Top 5 CPU Consumers ---"
+ps aux --sort=-%cpu | awk 'NR==1 || NR<=6 {print}'
+
+echo ""
+echo "--- Top 5 Memory Consumers ---"
+ps aux --sort=-%mem | awk 'NR==1 || NR<=6 {print}'
+
+echo ""
+echo "--- Zombie Processes ---"
+ZOMBIES=$(ps aux | awk '$8=="Z" {print $0}')
+if [ -z "$ZOMBIES" ]; then
+    echo "None found."
+else
+    echo "$ZOMBIES"
+fi
+
+echo ""
+echo "--- High CPU Alert (> 80%) ---"
+ps aux | awk 'NR>1 && $3>80 {print "WARNING: PID "$2" ("$11") using "$3"% CPU"}'
+Troubleshooting scenario
+
+"A service randomly stops. You don't know why."
+
+This is the framework — in order, no skipping:
+
+bash
+# Step 1: Check the service status and last logs
+systemctl status <service>
+journalctl -u <service> --since "1 hour ago"
+# Look for: exit code, signal that killed it, last log lines before death
+
+# Step 2: What was the exit code?
+# Exit 0 = clean exit (someone stopped it intentionally)
+# Exit 1 = error
+# Exit 137 = killed by signal 9 (SIGKILL) — often OOM killer
+# Exit 143 = killed by signal 15 (SIGTERM) — systemd or another process stopped it
+
+# Step 3: Check if OOM killer fired
+dmesg -T | grep -i "killed process"
+journalctl -k | grep -i "out of memory"
+
+# Step 4: Check resource limits
+systemctl show <service> | grep -E "Memory|CPU|Limit"
+
+# Step 5: Check dependencies — did something it depends on fail first?
+systemctl list-dependencies <service>
+
+# Step 6: Did the config change?
+journalctl -u <service> -b -1
+# -b -1 = logs from the PREVIOUS boot (critical if system rebooted)
+
+The exit code is your first real clue. 137 almost always means OOM. 143 means something sent SIGTERM. 1 means the process itself errored — check the logs for the actual error message.
+
+The connection to yesterday
+
+Yesterday: /proc is a live kernel interface.
+
+Today: every process has its own directory in /proc/<pid>/ — that's where all this state lives. ps and top just read from /proc and format it nicely. You can always go directly:
+
+bash
+cat /proc/<pid>/status      # state, memory, PIDs
+cat /proc/<pid>/cmdline | tr '\0' ' '    # full command that started the process
+ls /proc/<pid>/fd           # open file descriptors
+cat /proc/<pid>/limits      # resource limits (open files, max processes, etc.)
+
+This matters in production when tools aren't available. /proc is always there.
